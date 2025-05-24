@@ -1,21 +1,30 @@
 #!/bin/bash
 
-MODEL_PATH="$HOME/projects/paligemma-weights/paligemma-3b-pt-224"
-PROMPT="this building is "
-IMAGE_FILE_PATH="test_images/pic1.jpeg"
-MAX_TOKENS_TO_GENERATE=100
-TEMPERATURE=0.8
-TOP_P=0.9
-DO_SAMPLE="False"
-ONLY_CPU="False"
+# --- Configuration ---
+MODEL_PATH="google/paligemma-3b-pt-224"
+LORA_WEIGHTS_PATH="./paligemma_finetuned_hub/lora_weights_final.pt"
+PROMPT="extract data in JSON format"
+IMAGE_FILE_PATH="image_0.PNG"
+SCRIPT="inference.py"
 
-python inference.py \
+# --- Check if required files exist ---
+if [[ ! -f "$SCRIPT" ]]; then
+    echo "Error: $SCRIPT not found in current directory."
+    exit 1
+fi
+
+if [[ ! -f "$IMAGE_FILE_PATH" ]]; then
+    echo "Error: Image file '$IMAGE_FILE_PATH' not found."
+    exit 1
+fi
+
+if [[ ! -f "$LORA_WEIGHTS_PATH" ]]; then
+    echo "Warning: LoRA weights file '$LORA_WEIGHTS_PATH' not found. Continuing..."
+fi
+
+# --- Run inference ---
+python "$SCRIPT" \
     --model_path "$MODEL_PATH" \
+    --lora_weights_path "$LORA_WEIGHTS_PATH" \
     --prompt "$PROMPT" \
-    --image_file_path "$IMAGE_FILE_PATH" \
-    --max_tokens_to_generate $MAX_TOKENS_TO_GENERATE \
-    --temperature $TEMPERATURE \
-    --top_p $TOP_P \
-    --do_sample $DO_SAMPLE \
-    --only_cpu $ONLY_CPU \
-
+    --image_file_path "$IMAGE_FILE_PATH"
