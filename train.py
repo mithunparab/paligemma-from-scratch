@@ -1,16 +1,16 @@
 """
 Architectural notes:
-- The code is structured for both single-GPU and multi-GPU (DDP) training, with dataset download synchronization.
-- Data loading and model preparation are modularized for clarity.
-- TODO: Add support for other dataset formats (e.g., CSV, XML) if needed.
-- TODO: Consider abstracting distributed setup/teardown and dataset download into context managers for robustness.
-- TODO: The training/validation loop could be refactored for extensibility (callbacks, hooks, etc.).
-- TODO: Current LoRA state_dict extraction assumes naming conventions; revisit if model structure changes.
+- This code supports both single-GPU and multi-GPU (DDP) training.
+- Dataset loading is modularized via `dataset.py`.
+- TODO: Consider a dataset factory or registry pattern for extensibility across formats.
+- TODO: Abstract distributed setup/teardown into context managers for robustness.
+- TODO: Refactor training/validation loop for extensibility (callbacks, hooks, etc.).
+- TODO: LoRA state_dict extraction assumes naming conventions; revisit if model structure changes.
 """
 
 import torch
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from PIL import Image
 import json
 import os
@@ -22,7 +22,6 @@ import torch.distributed as dist
 import torch.nn.parallel as ddp
 from torch.utils.data.distributed import DistributedSampler
 
-from roboflow import Roboflow
 from modeling_gemma import (
     LoraConfig, add_lora_adapters, mark_only_lora_as_trainable, print_trainable_parameters
 )
@@ -30,61 +29,12 @@ from processing_paligemma import PaliGemmaProcessor
 from utils import load_hf_model
 from typing import Optional, List, Dict, Any, Tuple
 
-class JSONLDataset(Dataset):
-    """
-    Dataset for loading image-text pairs from a JSONL file and corresponding image directory.
+from dataset import get_dataset_metadata, create_pytorch_dataset
 
-    Parameters
-    ----------
-    jsonl_file_path : str
-        Path to the JSONL file containing metadata.
-    image_directory_path : str
-        Directory containing image files referenced in the JSONL.
-    max_samples : Optional[int]
-        If set, limits the dataset to the first `max_samples` entries.
-
-    Notes
-    -----
-    Skips malformed JSON lines and entries missing required keys.
-    Raises FileNotFoundError if an image is missing.
-    """
-    def __init__(self, jsonl_file_path: str, image_directory_path: str, max_samples: Optional[int] = None):
-        self.jsonl_file_path = jsonl_file_path
-        self.image_directory_path = image_directory_path
-        self.entries = self._load_entries()
-        if max_samples is not None and max_samples < len(self.entries):
-            self.entries = self.entries[:max_samples]
-
-    def _load_entries(self) -> List[Dict[str, Any]]:
-        entries = []
-        with open(self.jsonl_file_path, 'r') as file:
-            for line in file:
-                try:
-                    data = json.loads(line)
-                    if 'image' in data and 'suffix' in data:
-                        entries.append(data)
-                except json.JSONDecodeError:
-                    print(f"Skipping malformed JSON line: {line.strip()}")
-        return entries
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def __getitem__(self, idx: int) -> Tuple[Image.Image, Dict[str, Any]]:
-        if idx < 0 or idx >= len(self.entries):
-            raise IndexError("Index out of range")
-        entry = self.entries[idx]
-        image_path = os.path.join(self.image_directory_path, entry['image'])
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except FileNotFoundError:
-            print(f"Image not found: {image_path}")
-            raise
-        return image, entry
 
 class PaliGemmaCollator:
     """
-    Collator for batching image-text data for PaliGemma.
+    Batches and tokenizes image-text data for PaliGemma.
 
     Parameters
     ----------
@@ -103,6 +53,19 @@ class PaliGemmaCollator:
         self.max_seq_length = max_seq_length
 
     def __call__(self, batch: List[Tuple[Image.Image, Dict[str, Any]]]) -> Dict[str, torch.Tensor]:
+        """
+        Collates a batch of (image, label_json) pairs into model-ready tensors.
+
+        Parameters
+        ----------
+        batch : List[Tuple[Image.Image, Dict[str, Any]]]
+            List of image and label dict pairs.
+
+        Returns
+        -------
+        Dict[str, torch.Tensor]
+            Tokenized and batched input for the model.
+        """
         images, labels_json = zip(*batch)
         images = list(images)
         prompts = ["extract data in JSON format" for _ in labels_json]
@@ -126,10 +89,8 @@ class PaliGemmaCollator:
 
 def main(
     model_path: str,
-    roboflow_api_key: str,
-    roboflow_workspace: str,
-    roboflow_project: str,
-    roboflow_version: int,
+    dataset_type: str, 
+    dataset_config: dict,
     output_dir: str = "paligemma_finetuned_lora",
     epochs: int = 3,
     batch_size: int = 1,
@@ -149,51 +110,61 @@ def main(
     use_gradient_checkpointing: bool = False,
 ):
     """
-    Main training loop for PaliGemma with LoRA adapters and Roboflow dataset.
+    Main training loop for PaliGemma with LoRA adapters.
 
     Parameters
     ----------
     model_path : str
-        Path or HuggingFace identifier for the base model.
-    roboflow_api_key : str
-        API key for Roboflow dataset download.
-    roboflow_workspace : str
-        Roboflow workspace name.
-    roboflow_project : str
-        Roboflow project name.
-    roboflow_version : int
-        Roboflow dataset version.
-    output_dir : str
-        Directory to save LoRA weights.
-    epochs : int
+        Path to the base model.
+    dataset_type : str
+        Identifier for dataset type.
+    dataset_config : dict
+        Dataset configuration parameters.
+    output_dir : str, optional
+        Directory to save outputs.
+    epochs : int, optional
         Number of training epochs.
-    batch_size : int
-        Per-GPU batch size.
-    learning_rate : float
-        Learning rate for AdamW.
-    lora_r, lora_alpha, lora_dropout, lora_target_modules
-        LoRA adapter configuration.
-    max_seq_length : int
-        Max sequence length for tokenization.
-    save_steps : int
-        Save LoRA weights every `save_steps`.
-    gradient_accumulation_steps : int
+    batch_size : int, optional
+        Batch size per device.
+    learning_rate : float, optional
+        Learning rate for optimizer.
+    lora_r : int, optional
+        LoRA rank.
+    lora_alpha : int, optional
+        LoRA alpha scaling.
+    lora_dropout : float, optional
+        LoRA dropout probability.
+    lora_target_modules : List[str], optional
+        Target modules for LoRA adaptation.
+    max_seq_length : int, optional
+        Maximum sequence length for tokenization.
+    save_steps : int, optional
+        Steps between saving LoRA weights.
+    gradient_accumulation_steps : int, optional
         Number of steps to accumulate gradients.
-    use_bfloat16 : bool
-        Use bfloat16 if available.
-    max_train_samples, max_val_samples : Optional[int]
-        Limit number of samples for train/val.
-    num_dataloader_workers : int
-        Number of DataLoader workers.
-    hf_token : Optional[str]
-        HuggingFace token for private models.
-    use_gradient_checkpointing : bool
-        Enable gradient checkpointing for memory efficiency.
+    use_bfloat16 : bool, optional
+        Whether to use bfloat16 precision.
+    max_train_samples : Optional[int], optional
+        Maximum number of training samples.
+    max_val_samples : Optional[int], optional
+        Maximum number of validation samples.
+    num_dataloader_workers : int, optional
+        Number of DataLoader worker processes.
+    hf_token : Optional[str], optional
+        HuggingFace token for model loading.
+    use_gradient_checkpointing : bool, optional
+        Whether to use gradient checkpointing.
+
+    Returns
+    -------
+    None
 
     Notes
     -----
-    Handles distributed setup/teardown and dataset download synchronization.
-    Cleans up CUDA memory and DDP group at the end.
+    - Handles both single and distributed (DDP) training.
+    - Only LoRA parameters are trainable.
+    - Saves LoRA weights periodically and at the end.
+    - Handles edge cases for pad_token_id and dtype support.
     """
     is_distributed = "LOCAL_RANK" in os.environ
     if is_distributed:
@@ -224,29 +195,23 @@ def main(
     if rank == 0:
         print(f"[{rank}/{world_size}] Using dtype: {model_dtype}")
 
-    # Only rank 0 downloads the dataset; others wait and then re-derive the path.
-    dataset_location = None
     if rank == 0:
-        print("Downloading dataset from Roboflow...")
-        rf = Roboflow(api_key=roboflow_api_key)
-        project = rf.workspace(roboflow_workspace).project(roboflow_project)
-        version_obj = project.version(roboflow_version)
-        dataset_download = version_obj.download("jsonl")
-        dataset_location = dataset_download.location
-        print(f"Dataset downloaded to: {dataset_location}")
+        print(f"Preparing dataset of type '{dataset_type}'...")
 
-    if is_distributed:
-        dist.barrier()
-        if rank != 0:
-            rf_temp = Roboflow(api_key=roboflow_api_key)
-            proj_temp = rf_temp.workspace(roboflow_workspace).project(roboflow_project)
-            ver_temp = proj_temp.version(roboflow_version)
-            dataset_location = ver_temp.download("jsonl").location
+    train_data_path, train_image_dir, val_data_path, val_image_dir, dataset_format_id = get_dataset_metadata(
+        dataset_type=dataset_type,
+        dataset_config=dataset_config,
+        rank=rank,
+        world_size=world_size
+    )
 
-    train_jsonl_path = os.path.join(dataset_location, "train", "annotations.jsonl")
-    train_img_dir_path = os.path.join(dataset_location, "train")
-    val_jsonl_path = os.path.join(dataset_location, "valid", "annotations.jsonl")
-    val_img_dir_path = os.path.join(dataset_location, "valid")
+    if rank == 0:
+        print(f"Dataset metadata acquired:")
+        print(f"  Train data path: {train_data_path}")
+        print(f"  Train image dir: {train_image_dir if train_image_dir else 'N/A'}")
+        print(f"  Val data path  : {val_data_path}")
+        print(f"  Val image dir  : {val_image_dir if val_image_dir else 'N/A'}")
+        print(f"  Dataset format : {dataset_format_id}")
 
     if rank == 0:
         print(f"Loading base model from {model_path}...")
@@ -263,6 +228,8 @@ def main(
         tokenizer.pad_token = "<pad>"
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = 0
 
     lora_conf = LoraConfig(
         r=lora_r,
@@ -279,18 +246,15 @@ def main(
     model = model.to(device=device, dtype=model_dtype)
 
     if is_distributed:
+        # I’m keeping find_unused_parameters=False here; with current LoRA setup and no gradient checkpointing, all params should be used. Set to True if DDP errors arise.
         model = ddp.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if rank == 0:
         print_trainable_parameters(model)
 
-    # Access config via .module if DDP-wrapped
-    if is_distributed:
-        num_image_tokens = model.module.config.text_config.num_image_tokens
-        image_size = model.module.config.vision_config.image_size
-    else:
-        num_image_tokens = model.config.text_config.num_image_tokens
-        image_size = model.config.vision_config.image_size
+    current_model_config = model.module.config if is_distributed else model.config
+    num_image_tokens = current_model_config.text_config.num_image_tokens
+    image_size = current_model_config.vision_config.image_size
 
     processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
     if tokenizer.pad_token_id is not None and processor.tokenizer.pad_token_id is None:
@@ -303,9 +267,31 @@ def main(
     )
 
     if rank == 0:
-        print("Loading datasets from downloaded Roboflow paths...")
-    train_dataset_obj = JSONLDataset(train_jsonl_path, train_img_dir_path, max_samples=max_train_samples)
-    val_dataset_obj = JSONLDataset(val_jsonl_path, val_img_dir_path, max_samples=max_val_samples)
+        print("Creating PyTorch datasets...")
+
+    train_split_name = dataset_config.get("train_split", "train")
+    val_split_name = dataset_config.get("val_split", "validation")
+    
+    dataset_creation_kwargs = {}
+    if "sort_json_key" in dataset_config:
+        dataset_creation_kwargs["sort_json_key"] = dataset_config["sort_json_key"]
+
+    train_dataset_obj = create_pytorch_dataset(
+        dataset_format_identifier=dataset_format_id,
+        data_path=train_data_path,
+        image_dir_path=train_image_dir,
+        max_samples=max_train_samples,
+        split=train_split_name if dataset_format_id == "hf_cord" else None,
+        **dataset_creation_kwargs
+    )
+    val_dataset_obj = create_pytorch_dataset(
+        dataset_format_identifier=dataset_format_id,
+        data_path=val_data_path,
+        image_dir_path=val_image_dir,
+        max_samples=max_val_samples,
+        split=val_split_name if dataset_format_id == "hf_cord" else None,
+        **dataset_creation_kwargs
+    )
 
     if is_distributed:
         train_sampler = DistributedSampler(train_dataset_obj, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
@@ -329,8 +315,8 @@ def main(
             drop_last=True
         )
     else:
-        train_loader = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collator_instance, num_workers=num_dataloader_workers)
-        val_loader = DataLoader(val_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collator_instance, num_workers=num_dataloader_workers)
+        train_loader = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collator_instance, num_workers=num_dataloader_workers, drop_last=True)
+        val_loader = DataLoader(val_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collator_instance, num_workers=num_dataloader_workers, drop_last=True)
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
 
@@ -343,60 +329,76 @@ def main(
         epoch_start_time = time.time()
         model.train()
         train_loss_accum = 0.0
-        optimizer.zero_grad()
 
         if is_distributed:
-            train_sampler.set_epoch(epoch)  # Ensures shuffling is different each epoch
+            train_sampler.set_epoch(epoch)
+
+        optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
-            # All tensors in 'batch' are on CPU; move to device as needed.
             input_ids = batch["input_ids"].to(device, non_blocking=True)
-            pixel_values = batch["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
+            pixel_values_batch = batch["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True) if batch["labels"] is not None else None
 
-            outputs = model(
+            # I’m keeping this explicit model_to_call logic to ensure DDP-wrapped models are handled correctly.
+            model_to_call = model.module if is_distributed else model
+            
+            outputs = model_to_call(
                 input_ids=input_ids,
-                pixel_values=pixel_values,
+                pixel_values=pixel_values_batch,
                 attention_mask=attention_mask,
                 labels=labels,
-                kv_cache=None
+                kv_cache=None 
             )
             loss = outputs["loss"]
 
             if loss is None:
                 if rank == 0:
-                    print("Warning: Loss is None.")
+                    print(f"Warning: Loss is None at epoch {epoch+1}, step {step}. Skipping batch.")
+                continue
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    print(f"Warning: NaN or Inf loss detected at epoch {epoch+1}, step {step}. Loss: {loss.item()}. Skipping batch update.")
+                optimizer.zero_grad()
                 continue
 
             loss = loss / gradient_accumulation_steps
-            train_loss_accum += loss.detach().item() * gradient_accumulation_steps
+            current_batch_loss = loss.detach().item() * gradient_accumulation_steps
+            train_loss_accum += current_batch_loss
 
+            # DDP: loss.backward() synchronizes gradients across processes when find_unused_parameters=False.
             loss.backward()
 
             if (step + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
 
                 if rank == 0 and global_step > 0 and global_step % 10 == 0:
-                    avg_loss = train_loss_accum / (10 * gradient_accumulation_steps)
-                    print(f"Epoch {epoch+1}, Global Step {global_step}, Train Loss: {avg_loss:.4f}")
+                    avg_loss_interval = train_loss_accum / (10 * gradient_accumulation_steps)
+                    print(f"Epoch {epoch+1}, Global Step {global_step}, Train Loss: {avg_loss_interval:.4f}")
                     train_loss_accum = 0.0
 
                 if rank == 0 and global_step > 0 and global_step % save_steps == 0:
                     print(f"Saving LoRA adapter weights at global step {global_step}...")
                     lora_weights_path = os.path.join(output_dir, f"lora_weights_step_{global_step}.pt")
-                    # I’m keeping this block: DDP-wrapped model requires .module for state_dict access.
-                    lora_state_dict = {k: v for k, v in model.module.state_dict().items() if "lora_" in k}
+                    model_state_dict_to_save = model.module.state_dict() if is_distributed else model.state_dict()
+                    lora_state_dict = {k: v for k, v in model_state_dict_to_save.items() if "lora_" in k}
                     torch.save(lora_state_dict, lora_weights_path)
                     print(f"LoRA weights saved to {lora_weights_path}")
+        
+        # I’m keeping this block to ensure any remaining accumulated gradients are applied at epoch end.
+        if (step + 1) % gradient_accumulation_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         epoch_duration = time.time() - epoch_start_time
         if rank == 0:
             print(f"Epoch {epoch+1} completed in {epoch_duration:.2f}s.")
 
-        # Validation loop: runs on all ranks, but only rank 0 aggregates and prints.
         model.eval()
         val_loss_accum = 0.0
         val_steps = 0
@@ -405,24 +407,28 @@ def main(
         with torch.no_grad():
             for batch_val in val_loader:
                 input_ids_val = batch_val["input_ids"].to(device, non_blocking=True)
-                pixel_values_val = batch_val["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
+                pixel_values_val_batch = batch_val["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
                 attention_mask_val = batch_val["attention_mask"].to(device, non_blocking=True)
                 labels_val = batch_val["labels"].to(device, non_blocking=True) if batch_val["labels"] is not None else None
-
-                outputs_val = model(
+                
+                model_to_call_eval = model.module if is_distributed else model
+                outputs_val = model_to_call_eval(
                     input_ids=input_ids_val,
-                    pixel_values=pixel_values_val,
+                    pixel_values=pixel_values_val_batch,
                     attention_mask=attention_mask_val,
                     labels=labels_val,
                     kv_cache=None
                 )
                 loss_val = outputs_val["loss"]
                 if loss_val is not None:
-                    val_loss_accum += loss_val.item()
-                    val_steps += 1
+                    if not (torch.isnan(loss_val) or torch.isinf(loss_val)):
+                        val_loss_accum += loss_val.item()
+                        val_steps += 1
+                    elif rank == 0:
+                        print(f"Warning: NaN/Inf validation loss encountered. Value: {loss_val.item()}")
 
         if is_distributed:
-            # I’m keeping this: DDP requires explicit reduction for metrics.
+            # I’m keeping this reduction/barrier to ensure validation loss is aggregated across all processes.
             val_loss_tensor = torch.tensor(val_loss_accum, device=device)
             val_steps_tensor = torch.tensor(val_steps, device=device)
             dist.reduce(val_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
@@ -436,25 +442,21 @@ def main(
                 avg_val_loss = val_loss_accum / val_steps
                 print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss:.4f}")
             else:
-                print("No validation steps executed for epoch or val_loader empty.")
+                print(f"Epoch {epoch+1}: No valid validation steps executed or val_loader empty. Unable to calculate validation loss.")
 
     if rank == 0:
         print("Training finished. Saving final LoRA adapter weights...")
         final_lora_weights_path = os.path.join(output_dir, "lora_weights_final.pt")
-        if is_distributed:
-            lora_state_dict = {k: v for k, v in model.module.state_dict().items() if "lora_" in k}
-        else:
-            lora_state_dict = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+        model_state_dict_to_save = model.module.state_dict() if is_distributed else model.state_dict()
+        lora_state_dict = {k: v for k, v in model_state_dict_to_save.items() if "lora_" in k}
         torch.save(lora_state_dict, final_lora_weights_path)
         print(f"Final LoRA weights saved to {final_lora_weights_path}")
 
-    # I’m keeping this: Ensures all ranks finish before cleanup to avoid deadlocks.
     if is_distributed:
         dist.barrier()
 
-    # Explicit cleanup to avoid CUDA OOM in multi-run scenarios.
-    del model
-    del optimizer
+    del model, optimizer
+    del train_dataset_obj, val_dataset_obj, train_loader, val_loader, collator_instance, processor
     if device != "cpu":
         torch.cuda.empty_cache()
 
@@ -463,15 +465,17 @@ def main(
 
 if __name__ == "__main__":
     try:
-        # I’m keeping this: PyTorch requires 'spawn' for CUDA DataLoader workers.
-        mp.set_start_method('spawn', force=True)
-        print("Multiprocessing start method set to 'spawn'. This is required for CUDA with num_dataloader_workers > 0.")
+        # I’m keeping this block to ensure 'spawn' is set for multiprocessing, which is required for CUDA DataLoader workers.
+        if mp.get_start_method(allow_none=True) != 'spawn':
+            mp.set_start_method('spawn', force=True)
+            print("Multiprocessing start method set to 'spawn'.")
+        else:
+            print("Multiprocessing start method already 'spawn' or previously set.")
     except RuntimeError as e:
         current_method = mp.get_start_method(allow_none=True)
-        if current_method != 'spawn':
-            print(f"Warning: Could not set multiprocessing start method to 'spawn' (currently {current_method}): {e}. If using CUDA with num_dataloader_workers > 0, this may cause issues.")
-        else:
-            print(f"Multiprocessing start method already set to 'spawn'.")
-        pass
+        print(f"Warning: Could not set multiprocessing start method to 'spawn' (currently {current_method}): {e}. "
+              "If using CUDA with num_dataloader_workers > 0, this might lead to issues if not already 'spawn'.")
+    except Exception as e: 
+        print(f"An unexpected error occurred while setting multiprocessing start method: {e}")
 
     fire.Fire(main)
