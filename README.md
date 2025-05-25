@@ -87,4 +87,5 @@ A minimal, from-scratch implementation of key components from the PaLiGemma proj
 ## References
 
 [1] [PaLiGemma](https://huggingface.co/google/paligemma-3b-pt-224)
+
 [2] [pytorch-paligemma (inference only)](https://github.com/hkproj/pytorch-paligemma)
