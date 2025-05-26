@@ -20,6 +20,8 @@ LEARNING_RATE=${LEARNING_RATE:-1e-4}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-512}
 USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING:-True}
 USE_BFLOAT16=${USE_BFLOAT16:-True}
+# Add SEED here if not explicitly passed to the script, defaulting to 42
+TRAINING_SEED=${TRAINING_SEED:-42}
 
 CMD="python train.py"
 if [ "$NPROC" -gt 1 ]; then
@@ -36,4 +38,5 @@ $CMD \
   --learning_rate "$LEARNING_RATE" \
   --max_seq_length "$MAX_SEQ_LENGTH" \
   --use_gradient_checkpointing "$USE_GRADIENT_CHECKPOINTING" \
-  --use_bfloat16 "$USE_BFLOAT16"
+  --use_bfloat16 "$USE_BFLOAT16" \
+  --seed "$TRAINING_SEED" 

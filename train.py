@@ -17,6 +17,8 @@ import os
 import fire
 import time
 import torch.multiprocessing as mp
+import random # For set_seed
+import numpy as np # For set_seed
 
 import torch.distributed as dist
 import torch.nn.parallel as ddp
@@ -30,6 +32,20 @@ from utils import load_hf_model
 from typing import Optional, List, Dict, Any, Tuple
 
 from dataset import get_dataset_metadata, create_pytorch_dataset
+
+
+def set_seed(seed: int):
+    """
+    Sets the random seed for reproducibility across different libraries.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    # Ensure deterministic behavior for CUDA (might impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"Global seed set to {seed} for reproducibility.")
 
 
 class PaliGemmaCollator:
@@ -59,23 +75,44 @@ class PaliGemmaCollator:
         Parameters
         ----------
         batch : List[Tuple[Image.Image, Dict[str, Any]]]
-            List of image and label dict pairs.
+            List of image and label dict pairs. The dict may contain 'suffix' and 'language'.
 
         Returns
         -------
         Dict[str, torch.Tensor]
             Tokenized and batched input for the model.
         """
-        images, labels_json = zip(*batch)
+        # Filter out any placeholder entries (e.g., from failed image loads)
+        # Note: This means DataLoader's batch_size might not always reflect effective batch size.
+        # For simplicity, we just filter and let PyTorch handle smaller batches or raise error if empty.
+        filtered_batch = [item for item in batch if item[0] is not None and "suffix" in item[1] and "error" not in item[1]["suffix"]]
+        
+        if not filtered_batch:
+            # Return empty tensors that can be skipped in the training loop
+            return {
+                "input_ids": torch.empty(0, dtype=torch.long),
+                "attention_mask": torch.empty(0, dtype=torch.long),
+                "pixel_values": torch.empty(0, dtype=torch.float),
+                "labels": torch.empty(0, dtype=torch.long)
+            }
+
+        images, labels_meta = zip(*filtered_batch)
         images = list(images)
-        prompts = ["extract data in JSON format" for _ in labels_json]
+        
+        # Prompts can be fixed or derived from language/task
+        # For this setup, a fixed prompt "extract data in JSON format" is used.
+        # If language-specific prompts are needed, modify this.
+        prompts = ["extract data in JSON format" for _ in labels_meta]
+        
         target_suffixes = []
-        for entry in labels_json:
+        for entry in labels_meta:
             suffix_content = entry["suffix"]
+            # Suffix could be a string or a dict (if original dataset had it as JSON)
             if isinstance(suffix_content, dict):
                 target_suffixes.append(json.dumps(suffix_content))
             else:
                 target_suffixes.append(str(suffix_content))
+        
         inputs = self.processor(
             text=prompts,
             images=images,
@@ -108,6 +145,7 @@ def main(
     num_dataloader_workers: int = 2,
     hf_token: Optional[str] = None,
     use_gradient_checkpointing: bool = False,
+    seed: int = 42, # Added seed argument
 ):
     """
     Main training loop for PaliGemma with LoRA adapters.
@@ -117,9 +155,13 @@ def main(
     model_path : str
         Path to the base model.
     dataset_type : str
-        Identifier for dataset type.
+        Identifier for dataset type. Supported: "roboflow_jsonl", "huggingface_cord", "flickr8k".
     dataset_config : dict
-        Dataset configuration parameters.
+        Configuration dictionary for the dataset.
+        - For "roboflow_jsonl": Requires "roboflow_api_key", "roboflow_workspace", "roboflow_project", "roboflow_version".
+        - For "huggingface_cord": Requires "dataset_name", "train_split", "val_split".
+        - For "flickr8k": Requires "image_directory_path", "caption_files" (dict mapping lang to path).
+                          Optional: "split_ratio" (for internal train/val split), "random_seed" (for splitting).
     output_dir : str, optional
         Directory to save outputs.
     epochs : int, optional
@@ -154,18 +196,15 @@ def main(
         HuggingFace token for model loading.
     use_gradient_checkpointing : bool, optional
         Whether to use gradient checkpointing.
+    seed : int, optional
+        Random seed for reproducibility.
 
     Returns
     -------
     None
-
-    Notes
-    -----
-    - Handles both single and distributed (DDP) training.
-    - Only LoRA parameters are trainable.
-    - Saves LoRA weights periodically and at the end.
-    - Handles edge cases for pad_token_id and dtype support.
     """
+    set_seed(seed) # Set the global seed first
+
     is_distributed = "LOCAL_RANK" in os.environ
     if is_distributed:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -198,7 +237,7 @@ def main(
     if rank == 0:
         print(f"Preparing dataset of type '{dataset_type}'...")
 
-    train_data_path, train_image_dir, val_data_path, val_image_dir, dataset_format_id = get_dataset_metadata(
+    train_data_path, train_image_dir, val_data_path, val_image_dir, dataset_format_id, dataset_specific_kwargs = get_dataset_metadata(
         dataset_type=dataset_type,
         dataset_config=dataset_config,
         rank=rank,
@@ -212,6 +251,8 @@ def main(
         print(f"  Val data path  : {val_data_path}")
         print(f"  Val image dir  : {val_image_dir if val_image_dir else 'N/A'}")
         print(f"  Dataset format : {dataset_format_id}")
+        print(f"  Dataset specific kwargs: {dataset_specific_kwargs}")
+
 
     if rank == 0:
         print(f"Loading base model from {model_path}...")
@@ -219,7 +260,7 @@ def main(
     model, tokenizer = load_hf_model(
         model_path, device="cpu", model_dtype=model_dtype, token=hf_token,
         gradient_checkpointing=use_gradient_checkpointing,
-        use_cache=not use_gradient_checkpointing
+        use_cache=not use_gradient_checkpointing # Cache usually disabled with GC during training
     )
 
     if tokenizer.pad_token_id is None:
@@ -228,7 +269,7 @@ def main(
         tokenizer.pad_token = "<pad>"
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-            if tokenizer.pad_token_id is None:
+            if tokenizer.pad_token_id is None: # Fallback if convert_tokens_to_ids returns None
                 tokenizer.pad_token_id = 0
 
     lora_conf = LoraConfig(
@@ -246,7 +287,6 @@ def main(
     model = model.to(device=device, dtype=model_dtype)
 
     if is_distributed:
-        # I’m keeping find_unused_parameters=False here; with current LoRA setup and no gradient checkpointing, all params should be used. Set to True if DDP errors arise.
         model = ddp.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if rank == 0:
@@ -269,50 +309,52 @@ def main(
     if rank == 0:
         print("Creating PyTorch datasets...")
 
-    train_split_name = dataset_config.get("train_split", "train")
-    val_split_name = dataset_config.get("val_split", "validation")
+    train_split_name = dataset_config.get("train_split", "train") # Default for HF datasets, used by Flickr8k too
+    val_split_name = dataset_config.get("val_split", "validation") # Default for HF datasets, used by Flickr8k too
     
-    dataset_creation_kwargs = {}
-    if "sort_json_key" in dataset_config:
-        dataset_creation_kwargs["sort_json_key"] = dataset_config["sort_json_key"]
-
+    # Create training dataset
     train_dataset_obj = create_pytorch_dataset(
         dataset_format_identifier=dataset_format_id,
         data_path=train_data_path,
         image_dir_path=train_image_dir,
         max_samples=max_train_samples,
-        split=train_split_name if dataset_format_id == "hf_cord" else None,
-        **dataset_creation_kwargs
+        split=train_split_name, # Pass split name to dataset
+        **dataset_specific_kwargs # Pass Flickr8k specific kwargs like caption_files_dict, split_ratio, random_seed
     )
+    # Create validation dataset
     val_dataset_obj = create_pytorch_dataset(
         dataset_format_identifier=dataset_format_id,
         data_path=val_data_path,
         image_dir_path=val_image_dir,
         max_samples=max_val_samples,
-        split=val_split_name if dataset_format_id == "hf_cord" else None,
-        **dataset_creation_kwargs
+        split=val_split_name, # Pass split name to dataset
+        # For Flickr8k, ensure `is_validation_split=True` is passed when creating the validation split
+        is_validation_split=True if dataset_format_id == "flickr8k" else False, # Explicitly mark val split for Flickr8k
+        **dataset_specific_kwargs # Pass Flickr8k specific kwargs
     )
 
     if is_distributed:
+        # Samplers ensure each GPU gets a unique subset of data
         train_sampler = DistributedSampler(train_dataset_obj, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         val_sampler = DistributedSampler(val_dataset_obj, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True)
+        
         train_loader = DataLoader(
             train_dataset_obj,
             batch_size=batch_size,
-            sampler=train_sampler,
+            sampler=train_sampler, # Use sampler for DDP
             collate_fn=collator_instance,
             num_workers=num_dataloader_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True # Required when using DistributedSampler without handling remainder
         )
         val_loader = DataLoader(
             val_dataset_obj,
             batch_size=batch_size,
-            sampler=val_sampler,
+            sampler=val_sampler, # Use sampler for DDP
             collate_fn=collator_instance,
             num_workers=num_dataloader_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True # Required when using DistributedSampler without handling remainder
         )
     else:
         train_loader = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collator_instance, num_workers=num_dataloader_workers, drop_last=True)
@@ -331,17 +373,22 @@ def main(
         train_loss_accum = 0.0
 
         if is_distributed:
-            train_sampler.set_epoch(epoch)
+            train_sampler.set_epoch(epoch) # Crucial for proper shuffling in DDP
 
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
+            # Skip batches that resulted in empty tensors due to loading errors
+            if batch["input_ids"].numel() == 0:
+                if rank == 0:
+                    print(f"Warning: Skipping empty batch at epoch {epoch+1}, step {step}.")
+                continue
+
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             pixel_values_batch = batch["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True) if batch["labels"] is not None else None
 
-            # I’m keeping this explicit model_to_call logic to ensure DDP-wrapped models are handled correctly.
             model_to_call = model.module if is_distributed else model
             
             outputs = model_to_call(
@@ -368,7 +415,6 @@ def main(
             current_batch_loss = loss.detach().item() * gradient_accumulation_steps
             train_loss_accum += current_batch_loss
 
-            # DDP: loss.backward() synchronizes gradients across processes when find_unused_parameters=False.
             loss.backward()
 
             if (step + 1) % gradient_accumulation_steps == 0:
@@ -390,8 +436,9 @@ def main(
                     torch.save(lora_state_dict, lora_weights_path)
                     print(f"LoRA weights saved to {lora_weights_path}")
         
-        # I’m keeping this block to ensure any remaining accumulated gradients are applied at epoch end.
+        # Apply any remaining accumulated gradients at epoch end
         if (step + 1) % gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -406,6 +453,12 @@ def main(
             print("Running validation...")
         with torch.no_grad():
             for batch_val in val_loader:
+                # Skip batches that resulted in empty tensors due to loading errors
+                if batch_val["input_ids"].numel() == 0:
+                    if rank == 0:
+                        print(f"Warning: Skipping empty validation batch at epoch {epoch+1}.")
+                    continue
+
                 input_ids_val = batch_val["input_ids"].to(device, non_blocking=True)
                 pixel_values_val_batch = batch_val["pixel_values"].to(device, dtype=model_dtype, non_blocking=True)
                 attention_mask_val = batch_val["attention_mask"].to(device, non_blocking=True)
@@ -428,12 +481,11 @@ def main(
                         print(f"Warning: NaN/Inf validation loss encountered. Value: {loss_val.item()}")
 
         if is_distributed:
-            # I’m keeping this reduction/barrier to ensure validation loss is aggregated across all processes.
             val_loss_tensor = torch.tensor(val_loss_accum, device=device)
             val_steps_tensor = torch.tensor(val_steps, device=device)
             dist.reduce(val_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
             dist.reduce(val_steps_tensor, dst=0, op=dist.ReduceOp.SUM)
-            dist.barrier()
+            dist.barrier() # Ensure all processes have completed the reduction
             val_loss_accum = val_loss_tensor.item()
             val_steps = val_steps_tensor.item()
 
@@ -452,20 +504,22 @@ def main(
         torch.save(lora_state_dict, final_lora_weights_path)
         print(f"Final LoRA weights saved to {final_lora_weights_path}")
 
+    # Cleanup distributed environment and release resources
     if is_distributed:
-        dist.barrier()
+        dist.barrier() # Ensure all processes are done before cleanup
 
-    del model, optimizer
-    del train_dataset_obj, val_dataset_obj, train_loader, val_loader, collator_instance, processor
+    del model, optimizer # Explicitly delete large objects
+    del train_dataset_obj, val_dataset_obj, train_loader, val_loader, collator_instance, processor # Delete datasets and loaders
     if device != "cpu":
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache() # Clear CUDA cache
 
     if is_distributed:
         dist.destroy_process_group()
 
 if __name__ == "__main__":
     try:
-        # I’m keeping this block to ensure 'spawn' is set for multiprocessing, which is required for CUDA DataLoader workers.
+        # Ensure 'spawn' is set for multiprocessing. This is required for CUDA DataLoader workers.
+        # It must be called before any CUDA operations or other multiprocessing starts.
         if mp.get_start_method(allow_none=True) != 'spawn':
             mp.set_start_method('spawn', force=True)
             print("Multiprocessing start method set to 'spawn'.")
